@@ -49,7 +49,7 @@ phishing-detection-api/
 
 1. **Clone the repository**:
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/phutran1210dev/phishing-detection-api
    cd phishing-detection-api
    ```
 
