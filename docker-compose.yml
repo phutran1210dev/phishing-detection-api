@@ -1,90 +1,157 @@
+# Docker Compose for enterprise-grade deployment
 version: '3.8'
 
 services:
-  # FastAPI Application
+  # Main application
   phishing-api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: phishing-detection-api
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=mongodb://mongodb:27017
-      - DATABASE_NAME=phishing_detection
+      - ENVIRONMENT=development
+      - MONGODB_URL=mongodb://admin:secure_password_123@mongodb:27017/phishing_detection?authSource=admin
+      - REDIS_URL=redis://:redis_password_123@redis:6379
       - LOG_LEVEL=INFO
+      - WORKERS=4
     volumes:
-      - ./models:/app/models
       - ./logs:/app/logs
       - ./data:/app/data
+      - ./models:/app/models
+      - ./reports:/app/reports
     depends_on:
       - mongodb
-    restart: unless-stopped
+      - redis
     networks:
       - phishing-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
-  # MongoDB Database
+  # MongoDB database
   mongodb:
-    image: mongo:6.0
+    image: mongo:7.0
+    container_name: phishing-mongodb
     ports:
       - "27017:27017"
     environment:
       - MONGO_INITDB_ROOT_USERNAME=admin
-      - MONGO_INITDB_ROOT_PASSWORD=password
+      - MONGO_INITDB_ROOT_PASSWORD=secure_password_123
       - MONGO_INITDB_DATABASE=phishing_detection
     volumes:
       - mongodb_data:/data/db
-      - ./docker/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
-    restart: unless-stopped
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
     networks:
       - phishing-network
-
-  # MongoDB Express (Optional - for database management)
-  mongo-express:
-    image: mongo-express:latest
-    ports:
-      - "8081:8081"
-    environment:
-      - ME_CONFIG_MONGODB_ADMINUSERNAME=admin
-      - ME_CONFIG_MONGODB_ADMINPASSWORD=password
-      - ME_CONFIG_MONGODB_SERVER=mongodb
-      - ME_CONFIG_MONGODB_PORT=27017
-      - ME_CONFIG_BASICAUTH_USERNAME=admin
-      - ME_CONFIG_BASICAUTH_PASSWORD=admin
-    depends_on:
-      - mongodb
     restart: unless-stopped
-    networks:
-      - phishing-network
+    command: mongod --auth
 
-  # Nginx (Optional - for load balancing and SSL)
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./docker/ssl:/etc/nginx/ssl:ro
-    depends_on:
-      - phishing-api
-    restart: unless-stopped
-    networks:
-      - phishing-network
-
-  # Redis (Optional - for caching)
+  # Redis for caching and job queues
   redis:
     image: redis:7-alpine
+    container_name: phishing-redis
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    restart: unless-stopped
     networks:
       - phishing-network
-    command: redis-server --appendonly yes
+    restart: unless-stopped
+    command: redis-server --requirepass redis_password_123
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: phishing-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - phishing-api
+    networks:
+      - phishing-network
+    restart: unless-stopped
+
+  # Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: phishing-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - phishing-network
+    restart: unless-stopped
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: phishing-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - phishing-network
+    restart: unless-stopped
+
+  # ML model training service (separate container)
+  ml-trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml-trainer
+    container_name: phishing-ml-trainer
+    environment:
+      - MONGODB_URL=mongodb://admin:secure_password_123@mongodb:27017/phishing_detection?authSource=admin
+      - REDIS_URL=redis://:redis_password_123@redis:6379
+      - TRAINING_SCHEDULE=0 2 * * *  # Daily at 2 AM
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    depends_on:
+      - mongodb
+      - redis
+    networks:
+      - phishing-network
+    restart: unless-stopped
 
 volumes:
   mongodb_data:
+    driver: local
   redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
 
 networks:
   phishing-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
