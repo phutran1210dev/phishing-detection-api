@@ -1,0 +1,250 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: phishing-detection
+  labels:
+    app: mongodb
+spec:
+  serviceName: mongodb-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      containers:
+      - name: mongodb
+        image: mongo:7.0
+        ports:
+        - containerPort: 27017
+          name: mongo
+        env:
+        - name: MONGO_INITDB_ROOT_USERNAME
+          value: "admin"
+        - name: MONGO_INITDB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: phishing-secrets
+              key: mongodb-password
+        - name: MONGO_INITDB_DATABASE
+          value: "phishing_detection"
+        volumeMounts:
+        - name: mongodb-data
+          mountPath: /data/db
+        - name: mongodb-init
+          mountPath: /docker-entrypoint-initdb.d
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        livenessProbe:
+          exec:
+            command:
+            - mongo
+            - --eval
+            - "db.adminCommand('ping')"
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - mongo
+            - --eval
+            - "db.adminCommand('ping')"
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+      volumes:
+      - name: mongodb-init
+        configMap:
+          name: mongodb-init-scripts
+  volumeClaimTemplates:
+  - metadata:
+      name: mongodb-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "standard"
+      resources:
+        requests:
+          storage: 50Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: phishing-detection
+  labels:
+    app: mongodb
+spec:
+  type: ClusterIP
+  ports:
+  - port: 27017
+    targetPort: 27017
+    name: mongo
+  selector:
+    app: mongodb
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-headless
+  namespace: phishing-detection
+  labels:
+    app: mongodb
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+  - port: 27017
+    targetPort: 27017
+    name: mongo
+  selector:
+    app: mongodb
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongodb-init-scripts
+  namespace: phishing-detection
+data:
+  mongo-init.js: |
+    // Create application database and user
+    db = db.getSiblingDB('phishing_detection');
+    
+    // Create collections with validation
+    db.createCollection('detection_results', {
+      validator: {
+        $jsonSchema: {
+          bsonType: 'object',
+          required: ['url', 'timestamp', 'prediction'],
+          properties: {
+            url: { bsonType: 'string' },
+            timestamp: { bsonType: 'date' },
+            prediction: { bsonType: 'object' }
+          }
+        }
+      }
+    });
+    
+    db.createCollection('audit_logs', {
+      validator: {
+        $jsonSchema: {
+          bsonType: 'object',
+          required: ['event_id', 'timestamp', 'level', 'category'],
+          properties: {
+            event_id: { bsonType: 'string' },
+            timestamp: { bsonType: 'date' },
+            level: { bsonType: 'string' },
+            category: { bsonType: 'string' }
+          }
+        }
+      }
+    });
+    
+    // Create indexes for performance
+    db.detection_results.createIndex({ timestamp: -1 });
+    db.detection_results.createIndex({ 'prediction.is_phishing': 1 });
+    db.detection_results.createIndex({ url: 1 });
+    
+    db.audit_logs.createIndex({ timestamp: -1 });
+    db.audit_logs.createIndex({ level: 1 });
+    db.audit_logs.createIndex({ category: 1 });
+    db.audit_logs.createIndex({ event_type: 1 });
+    
+    print('Database initialization completed');
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: phishing-detection
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+          name: redis
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: phishing-secrets
+              key: redis-password
+        command:
+        - redis-server
+        - --requirepass
+        - $(REDIS_PASSWORD)
+        - --appendonly
+        - "yes"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: redis-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: phishing-detection
+  labels:
+    app: redis
+spec:
+  type: ClusterIP
+  ports:
+  - port: 6379
+    targetPort: 6379
+    name: redis
+  selector:
+    app: redis

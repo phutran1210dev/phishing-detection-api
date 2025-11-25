@@ -1,0 +1,189 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: phishing-detection
+  labels:
+    app: phishing-detection
+    version: "1.0"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: phishing-config
+  namespace: phishing-detection
+data:
+  MONGODB_URL: "mongodb://mongodb:27017/phishing_detection"
+  REDIS_URL: "redis://redis:6379"
+  LOG_LEVEL: "INFO"
+  WORKERS: "4"
+  ENVIRONMENT: "production"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: phishing-secrets
+  namespace: phishing-detection
+type: Opaque
+data:
+  # Base64 encoded secrets
+  mongodb-password: c2VjdXJlX3Bhc3N3b3JkXzEyMw==  # secure_password_123
+  redis-password: cmVkaXNfcGFzc3dvcmRfMTIz         # redis_password_123
+  jwt-secret: c3VwZXJfc2VjcmV0X2p3dF9rZXk=        # super_secret_jwt_key
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phishing-api
+  namespace: phishing-detection
+  labels:
+    app: phishing-api
+    version: "1.0"
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: phishing-api
+  template:
+    metadata:
+      labels:
+        app: phishing-api
+        version: "1.0"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: phishing-api
+        image: phishing-detection-api:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: MONGODB_URL
+          valueFrom:
+            configMapKeyRef:
+              name: phishing-config
+              key: MONGODB_URL
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: phishing-config
+              key: REDIS_URL
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: phishing-config
+              key: LOG_LEVEL
+        - name: WORKERS
+          valueFrom:
+            configMapKeyRef:
+              name: phishing-config
+              key: WORKERS
+        - name: MONGODB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: phishing-secrets
+              key: mongodb-password
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: phishing-secrets
+              key: redis-password
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: phishing-secrets
+              key: jwt-secret
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - name: models-storage
+          mountPath: /app/models
+        - name: logs-storage
+          mountPath: /app/logs
+        - name: reports-storage
+          mountPath: /app/reports
+      volumes:
+      - name: models-storage
+        persistentVolumeClaim:
+          claimName: models-pvc
+      - name: logs-storage
+        persistentVolumeClaim:
+          claimName: logs-pvc
+      - name: reports-storage
+        persistentVolumeClaim:
+          claimName: reports-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: phishing-api-service
+  namespace: phishing-detection
+  labels:
+    app: phishing-api
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: phishing-api
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: phishing-api-ingress
+  namespace: phishing-detection
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+  - hosts:
+    - phishing-api.example.com
+    secretName: phishing-api-tls
+  rules:
+  - host: phishing-api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: phishing-api-service
+            port:
+              number: 80
